@@ -1,0 +1,13 @@
+{
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
+  "maintainers": ["walkojas-boop"],
+  "categories": ["developer-tools", "web", "browser-automation"],
+  "description": "Headless-browser-as-JSON for AI agents, with memorymarket economics: the first agent to render a URL gets paid 90% of every cache-hit fee from subsequent agents within the 10-minute TTL. Real Chromium via Cloudflare Browser Rendering.",
+  "endpoint": "https://ghostdom.jason-12c.workers.dev/mcp",
+  "manifest": "https://ghostdom.jason-12c.workers.dev/.well-known/mcp.json",
+  "ai_plugin": "https://ghostdom.jason-12c.workers.dev/.well-known/ai-plugin.json",
+  "openapi": "https://ghostdom.jason-12c.workers.dev/openapi.json",
+  "llms_txt": "https://ghostdom.jason-12c.workers.dev/llms.txt",
+  "pricing": "https://ghostdom.jason-12c.workers.dev/v1/pricing",
+  "tags": ["browser", "render", "puppeteer", "memorymarket", "x402", "agents"]
+}

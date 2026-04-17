@@ -1,0 +1,33 @@
+name = "ghostdom"
+main = "src/index.ts"
+compatibility_date = "2024-12-30"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "7951a54cd5e84145910c76b633903e2c"
+
+[[kv_namespaces]]
+binding = "WALLETS"
+id = "c9a7020a308e48808d9c9cafc0428ac6"
+
+[[durable_objects.bindings]]
+name = "LEDGER"
+class_name = "Ledger"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Ledger"]
+
+[browser]
+binding = "MYBROWSER"
+
+[vars]
+PLATFORM_WALLET = "0xGHOSTDOM_PLATFORM_0000000000000000000000"
+PRICE_ORIGINATOR_USD = "0.003"
+PRICE_CACHE_HIT_USD = "0.0012"
+ORIGINATOR_SHARE = "0.9"
+CACHE_TTL_SECONDS = "600"

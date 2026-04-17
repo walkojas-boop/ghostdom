@@ -1,18 +1,28 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import puppeteer from '@cloudflare/puppeteer';
+import Stripe from 'stripe';
+
+const BASE_RPC = 'https://mainnet.base.org';
+const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+
+function stripeClient(secretKey: string) {
+  return new Stripe(secretKey, { httpClient: Stripe.createFetchHttpClient(), apiVersion: '2024-12-18.acacia' } as any);
+}
 
 // ---------- bindings ----------
 export interface Env {
-  CACHE: KVNamespace;           // rendered DOM cache
-  WALLETS: KVNamespace;         // wallet balances (address -> micro-USD integer)
-  LEDGER: DurableObjectNamespace; // memorymarket ledger (one instance per URL hash)
-  MYBROWSER: Fetcher;           // Cloudflare Browser Rendering
+  CACHE: KVNamespace;
+  WALLETS: KVNamespace;
+  LEDGER: DurableObjectNamespace;
+  MYBROWSER: Fetcher;
   PLATFORM_WALLET: string;
   PRICE_ORIGINATOR_USD: string;
   PRICE_CACHE_HIT_USD: string;
   ORIGINATOR_SHARE: string;
   CACHE_TTL_SECONDS: string;
+  STRIPE_SECRET_KEY: string;
+  STRIPE_WEBHOOK_SECRET: string;
 }
 
 const VERSION = '1.0.0';
@@ -345,6 +355,7 @@ app.get('/v1/wallets/:addr', async (c) => {
   return c.json({ wallet: w.addr, balance_usd: w.balance_micro / 1_000_000, balance_micro: w.balance_micro });
 });
 
+// ---------- fund wallet (LIVE: Stripe Checkout + x402 USDC) ----------
 app.post('/v1/wallets/fund', async (c) => {
   const body = await c.req.json().catch(() => ({} as any));
   const addr = body.wallet;
@@ -352,32 +363,208 @@ app.post('/v1/wallets/fund', async (c) => {
   const w = await walletGet(c.env, addr);
   if (!w) return err(c, 'invalid_wallet');
   const intent = 'pi_' + randomHex(12);
-  await c.env.WALLETS.put('intent:' + intent, JSON.stringify({ addr, amount_micro: usdToMicro(amount), paid: false }), { expirationTtl: 3600 });
   const base = `https://${c.req.header('host')}`;
+
+  // Create Stripe Checkout Session
+  let session: Stripe.Checkout.Session;
+  try {
+    const stripe = stripeClient(c.env.STRIPE_SECRET_KEY);
+    session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          unit_amount: Math.round(amount * 100),
+          product_data: {
+            name: `ghostdom wallet top-up`,
+            description: `Fund ghostdom wallet ${addr} with $${amount.toFixed(2)}`,
+          },
+        },
+        quantity: 1,
+      }],
+      success_url: `${base}/v1/wallets/fund/success?session_id={CHECKOUT_SESSION_ID}&intent=${intent}`,
+      cancel_url: `${base}/v1/wallets/fund/cancel`,
+      metadata: { service: 'ghostdom', intent, addr, amount_micro: String(usdToMicro(amount)) },
+    });
+  } catch (e: any) {
+    return c.json({ error: true, code: 'stripe_error', message: e?.message || 'stripe_failed', http_status: 502 }, 502);
+  }
+
+  await c.env.WALLETS.put('intent:' + intent, JSON.stringify({ addr, amount_micro: usdToMicro(amount), paid: false, session_id: session.id }), { expirationTtl: 3600 });
+
   return c.json({
     intent,
+    session_id: session.id,
     amount_usd: amount,
-    payment_url: `${base}/v1/wallets/fund/complete/${intent}`,
-    x402: { version: '0.1', scheme: 'exact', network: 'base-sepolia', max_amount_required: String(amount), asset: 'USDC', resource: `${base}/v1/wallets/${addr}`, description: `Fund ghostdom wallet ${addr} with $${amount}`, pay_to: c.env.PLATFORM_WALLET },
-    expires_in_seconds: 3600,
-    note: 'TEST MODE: GET payment_url to complete. Production would redirect to x402 facilitator / Coinbase Commerce.',
+    payment_url: session.url,
+    x402: {
+      version: '0.1',
+      scheme: 'exact',
+      network: 'base',
+      max_amount_required: String(amount),
+      asset: 'USDC',
+      asset_contract: USDC_BASE,
+      resource: `${base}/v1/payments/verify`,
+      description: `Fund ghostdom wallet ${addr} with $${amount}`,
+      pay_to: c.env.PLATFORM_WALLET,
+      verify_endpoint: `${base}/v1/payments/verify`,
+    },
+    expires_at: session.expires_at,
+    live_mode: true,
   });
 });
 
-app.get('/v1/wallets/fund/complete/:intent', async (c) => {
-  const intent = c.req.param('intent');
-  const raw = await c.env.WALLETS.get('intent:' + intent);
-  if (!raw) return c.json({ error: true, code: 'invalid_intent', http_status: 404 }, 404);
-  const row = JSON.parse(raw);
-  if (row.paid) return c.json({ status: 'already_paid', intent });
-  row.paid = true;
-  await c.env.WALLETS.put('intent:' + intent, JSON.stringify(row), { expirationTtl: 3600 });
-  const w = await walletGet(c.env, row.addr);
-  if (!w) return c.json({ error: true, code: 'invalid_wallet', http_status: 400 }, 400);
-  w.balance_micro += row.amount_micro;
-  await walletPut(c.env, w);
-  return c.json({ status: 'paid', intent, credited_usd: row.amount_micro / 1_000_000, balance_usd: w.balance_micro / 1_000_000, test_mode: true });
+// Stripe webhook — credits wallet on checkout.session.completed
+app.post('/stripe/webhook', async (c) => {
+  const sig = c.req.header('stripe-signature') || '';
+  const raw = await c.req.text();
+  let event: Stripe.Event;
+  try {
+    const stripe = stripeClient(c.env.STRIPE_SECRET_KEY);
+    event = await stripe.webhooks.constructEventAsync(raw, sig, c.env.STRIPE_WEBHOOK_SECRET);
+  } catch (e: any) {
+    return c.json({ error: 'invalid signature', detail: e?.message }, 400);
+  }
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object as Stripe.Checkout.Session;
+    if (session.metadata?.service !== 'ghostdom') return c.json({ received: true, ignored: 'not_ghostdom' });
+    const intent = session.metadata?.intent;
+    if (!intent) return c.json({ received: true, ignored: 'no_intent' });
+    const intentRaw = await c.env.WALLETS.get('intent:' + intent);
+    if (!intentRaw) return c.json({ received: true, ignored: 'intent_expired' });
+    const row = JSON.parse(intentRaw);
+    if (row.paid) return c.json({ received: true, already: true });
+    row.paid = true;
+    row.paid_via = 'stripe';
+    row.stripe_session = session.id;
+    await c.env.WALLETS.put('intent:' + intent, JSON.stringify(row), { expirationTtl: 3600 });
+    const wallet = await walletGet(c.env, row.addr);
+    if (wallet) {
+      wallet.balance_micro += row.amount_micro;
+      await walletPut(c.env, wallet);
+    }
+  }
+  return c.json({ received: true });
 });
+
+// Client-driven verify (alternative to webhook)
+app.post('/v1/wallets/fund/verify', async (c) => {
+  const body = await c.req.json().catch(() => ({} as any));
+  const sessionId = body.session_id;
+  if (!sessionId) return c.json({ error: true, code: 'missing_session_id', fix: 'Pass {"session_id":"cs_..."}', http_status: 400 }, 400);
+  try {
+    const stripe = stripeClient(c.env.STRIPE_SECRET_KEY);
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.metadata?.service !== 'ghostdom') return c.json({ error: true, code: 'wrong_service', http_status: 400 }, 400);
+    if (session.payment_status !== 'paid') return c.json({ error: true, code: 'not_paid', session_status: session.payment_status, http_status: 402 }, 402);
+    const intent = session.metadata?.intent;
+    const intentRaw = intent ? await c.env.WALLETS.get('intent:' + intent) : null;
+    if (!intentRaw) return c.json({ error: true, code: 'intent_expired', http_status: 404 }, 404);
+    const row = JSON.parse(intentRaw);
+    if (row.paid) return c.json({ status: 'already_credited', intent });
+    row.paid = true;
+    row.paid_via = 'stripe_verify';
+    await c.env.WALLETS.put('intent:' + intent!, JSON.stringify(row), { expirationTtl: 3600 });
+    const wallet = await walletGet(c.env, row.addr);
+    if (wallet) {
+      wallet.balance_micro += row.amount_micro;
+      await walletPut(c.env, wallet);
+    }
+    return c.json({ status: 'paid', intent, credited_usd: row.amount_micro / 1_000_000, balance_usd: (wallet?.balance_micro || 0) / 1_000_000, live_mode: true });
+  } catch (e: any) {
+    return c.json({ error: true, code: 'stripe_error', message: e?.message, http_status: 502 }, 502);
+  }
+});
+
+// x402 on-chain USDC verify
+app.post('/v1/payments/verify', async (c) => {
+  const body = await c.req.json().catch(() => ({} as any));
+  const addr = body.wallet;
+  const txHash = body.tx_hash;
+  if (!addr || !txHash) return c.json({ error: true, code: 'missing_input', fix: 'Pass {"wallet":"0x...","tx_hash":"0x..."}', http_status: 400 }, 400);
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return c.json({ error: true, code: 'bad_tx_hash', http_status: 400 }, 400);
+  const w = await walletGet(c.env, addr);
+  if (!w) return c.json({ error: true, code: 'invalid_wallet', http_status: 400 }, 400);
+  try {
+    const rpcRes = await fetch(BASE_RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_getTransactionReceipt', params: [txHash], id: 1 }) });
+    const rpc = await rpcRes.json() as any;
+    if (!rpc.result) return c.json({ error: true, code: 'tx_not_found', http_status: 404 }, 404);
+    const receipt = rpc.result;
+    if (receipt.status !== '0x1') return c.json({ error: true, code: 'tx_failed', http_status: 400 }, 400);
+    const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+    const logs = (receipt.logs || []).filter((l: any) => l.address?.toLowerCase() === USDC_BASE.toLowerCase() && l.topics?.[0] === TRANSFER_TOPIC);
+    if (!logs.length) return c.json({ error: true, code: 'no_usdc_transfer', fix: 'Send USDC to ' + c.env.PLATFORM_WALLET + ' on Base then retry.', http_status: 400 }, 400);
+    const toPadded = '0x' + c.env.PLATFORM_WALLET.slice(2).toLowerCase().padStart(64, '0');
+    const matching = logs.find((l: any) => l.topics[2]?.toLowerCase() === toPadded);
+    if (!matching) return c.json({ error: true, code: 'wrong_recipient', fix: 'Send to ' + c.env.PLATFORM_WALLET + '.', http_status: 400 }, 400);
+    const amountUsd = Number(BigInt(matching.data)) / 1_000_000;
+    // Idempotency: check a KV set of consumed tx hashes for this wallet
+    const consumedKey = 'tx:' + txHash.toLowerCase();
+    const existing = await c.env.WALLETS.get(consumedKey);
+    if (existing) return c.json({ status: 'already_credited', tx_hash: txHash, credited_to: existing });
+    await c.env.WALLETS.put(consumedKey, addr, { expirationTtl: 86400 * 30 });
+    w.balance_micro += usdToMicro(amountUsd);
+    await walletPut(c.env, w);
+    return c.json({ status: 'paid', tx_hash: txHash, amount_usd: amountUsd, balance_usd: w.balance_micro / 1_000_000, pay_to: c.env.PLATFORM_WALLET, network: 'base', live_mode: true });
+  } catch (e: any) {
+    return c.json({ error: true, code: 'rpc_error', message: e?.message, http_status: 502 }, 502);
+  }
+});
+
+// Withdrawal request (queued for manual processing)
+app.post('/v1/wallets/withdraw', async (c) => {
+  const w = authWallet(c);
+  if (!w) return err(c, 'missing_wallet');
+  const wrec = await walletGet(c.env, w.addr);
+  if (!wrec || wrec.signing_key !== w.key) return err(c, 'invalid_wallet');
+  const body = await c.req.json().catch(() => ({} as any));
+  const toAddr = body.to_usdc_address;
+  if (!toAddr || !/^0x[0-9a-fA-F]{40}$/.test(toAddr)) return c.json({ error: true, code: 'bad_address', fix: 'Pass {"to_usdc_address":"0x... (40 hex chars, Base mainnet)"}', http_status: 400 }, 400);
+  const MIN_WITHDRAWAL_MICRO = 1_000_000; // $1 minimum
+  if (wrec.balance_micro < MIN_WITHDRAWAL_MICRO) return c.json({ error: true, code: 'below_minimum', message: 'Minimum withdrawal is $1.00 USD.', fix: 'Accumulate more earnings or continue using the balance.', http_status: 400, balance_usd: wrec.balance_micro / 1_000_000 }, 400);
+  const requestId = 'wd_' + randomHex(10);
+  const request = {
+    request_id: requestId,
+    wallet: w.addr,
+    to_usdc_address: toAddr,
+    amount_micro: wrec.balance_micro,
+    amount_usd: wrec.balance_micro / 1_000_000,
+    requested_at: Math.floor(Date.now() / 1000),
+    status: 'pending',
+    network: 'base',
+    asset: 'USDC',
+  };
+  await c.env.WALLETS.put('withdrawal:' + requestId, JSON.stringify(request));
+  // Zero the wallet balance (held in escrow until processed)
+  wrec.balance_micro = 0;
+  await walletPut(c.env, wrec);
+  // Also store in a pending-list for operator review
+  const pending = await c.env.WALLETS.get('withdrawals:pending');
+  const list = pending ? JSON.parse(pending) : [];
+  list.push(requestId);
+  await c.env.WALLETS.put('withdrawals:pending', JSON.stringify(list));
+  return c.json({
+    status: 'queued',
+    request_id: requestId,
+    to_usdc_address: toAddr,
+    amount_usd: request.amount_usd,
+    network: 'base',
+    asset: 'USDC',
+    eta: '1-3 business days (manual operator review)',
+    note: 'Your wallet balance is held in escrow (set to $0.00) until this withdrawal is processed. If rejected, balance will be restored.',
+  });
+});
+
+app.get('/v1/wallets/withdraw/:request_id', async (c) => {
+  const id = c.req.param('request_id');
+  const raw = await c.env.WALLETS.get('withdrawal:' + id);
+  if (!raw) return c.json({ error: true, code: 'not_found', http_status: 404 }, 404);
+  return c.json(JSON.parse(raw));
+});
+
+// Stripe redirect landing pages
+app.get('/v1/wallets/fund/success', (c) => c.json({ status: 'stripe_redirect', session_id: c.req.query('session_id'), intent: c.req.query('intent'), next: 'Wallet will be credited automatically once Stripe webhook fires, or POST /v1/wallets/fund/verify with {"session_id":"..."} to force credit.' }));
+app.get('/v1/wallets/fund/cancel', (c) => c.json({ status: 'cancelled', next: 'Retry POST /v1/wallets/fund.' }));
 
 // ---------- logo ----------
 app.get('/logo', () => {

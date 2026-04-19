@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.walkojas-boop/ghostdom",
+  "title": "Ghostdom",
+  "description": "Headless-browser-as-JSON with memorymarket cache economics. Real Chromium, crypto settlement.",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/walkojas-boop/ghostdom",
+    "source": "github"
+  },
+  "websiteUrl": "https://ghostdom.jason-12c.workers.dev/",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://ghostdom.jason-12c.workers.dev/mcp"
+    }
+  ]
+}
